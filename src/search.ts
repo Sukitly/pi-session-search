@@ -1,3 +1,5 @@
+import type { DatabaseSync } from "node:sqlite";
+import { searchBM25ForUI } from "./db";
 import {
   escapeRipgrepRegex,
   parseRipgrepJson,
@@ -11,7 +13,11 @@ import type {
   MatchRange,
   SessionDocument,
   SessionMatch,
+  SessionMatchItem,
+  SessionMessageMatch,
   SessionMeta,
+  SessionSearchResult,
+  SnippetItem,
 } from "./types";
 
 export const REGEX_PREFIX = "re:";
@@ -150,6 +156,8 @@ export interface SearchOptions {
   signal?: AbortSignal;
   /** ripgrep executable override, for tests. */
   ripgrepCommand?: string;
+  /** Optional SQLite database for instant BM25 matching. */
+  db?: DatabaseSync;
 }
 
 export interface SearchResult {
@@ -251,6 +259,11 @@ export async function searchSessions(
 ): Promise<SearchResult> {
   const empty: SearchResult = { matches: [], truncated: 0 };
   if (query.kind === "empty" || options.sessions.length === 0) return empty;
+
+  if (options.db && query.kind === "literal") {
+    return searchBM25ForUI(options.db, query.needle, options.sessions);
+  }
+
   const rg: RipgrepOptions = {
     signal: options.signal,
     command: options.ripgrepCommand,
@@ -368,5 +381,71 @@ export function buildSnippet(
     after: flatten(text.slice(end, windowEnd)).trimEnd(),
     clippedStart: windowStart > 0,
     clippedEnd: windowEnd < text.length,
+  };
+}
+
+export function formatSearchResult(
+  rawMatches: SessionMatch[],
+  truncated: boolean | number,
+  options: {
+    limit: number;
+    maxMatchesPerSession: number;
+    snippetContext: number;
+    includeFullText: boolean;
+  },
+): SessionSearchResult {
+  const chosenSessions = rawMatches.slice(0, options.limit);
+  let totalHits = 0;
+
+  const sessions: SessionMatchItem[] = chosenSessions.map((item) => {
+    totalHits += item.hitCount;
+    const chosenDocs = item.matches.slice(0, options.maxMatchesPerSession);
+
+    const matches: SessionMessageMatch[] = chosenDocs.map((dm) => {
+      const snippets: SnippetItem[] = dm.ranges.slice(0, 3).map((range) => {
+        const snip = buildSnippet(
+          dm.document.text,
+          range,
+          options.snippetContext,
+          options.snippetContext,
+        );
+        const prefix = snip.clippedStart ? "... " : "";
+        const suffix = snip.clippedEnd ? " ..." : "";
+        return {
+          text: `${prefix}${snip.before}[${snip.match}]${snip.after}${suffix}`,
+          matchText: snip.match,
+        };
+      });
+
+      const resMatch: SessionMessageMatch = {
+        entryId: dm.document.entryId,
+        role: dm.document.role,
+        hitCount: dm.ranges.length,
+        snippets,
+      };
+
+      if (options.includeFullText) {
+        resMatch.fullText = dm.document.text;
+      }
+
+      return resMatch;
+    });
+
+    return {
+      id: item.session.id,
+      name: item.session.name,
+      title: item.session.title,
+      path: item.session.path,
+      modifiedAt: new Date(item.session.modified).toISOString(),
+      hitCount: item.hitCount,
+      matches,
+    };
+  });
+
+  return {
+    totalSessions: sessions.length,
+    totalHits,
+    truncated: Boolean(truncated),
+    sessions,
   };
 }

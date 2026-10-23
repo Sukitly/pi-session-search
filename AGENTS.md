@@ -9,14 +9,14 @@
 
 ## Project Invariants
 
-- The user-facing command is `/rs` (resume with search), not an Agent-facing tool.
+- The user-facing command is `/rs` (resume with search); the agent-facing tool is `session_search`.
 - Follow pi's current-project session scope. Do not scan the entire machine or silently include other projects.
 - Search user and assistant message text. Exclude thinking, tool calls, and tool results.
-- Literal matching is the default. Regex must be explicit, handle invalid patterns, and account for pathological-pattern responsiveness.
+- BM25 ranking via SQLite FTS5 is the default. Regex (`re:`) is supported as ripgrep fallback.
 - Group results by session and include matching snippets, not only the first message.
 - Resume the selected existing session through pi's supported API. Do not create a replacement session.
 - Search is read-only. Do not rewrite session files or send their contents to external services.
-- Search runs ripgrep over the session files on every query. No persistent index and no cache that outlives the picker.
+- Search uses a local derived SQLite FTS5 index inside the session directory with incremental mtime updates.
 - Do not describe planned behavior as implemented in documentation or placeholder UI.
 
 ## Tooling and Code Quality
@@ -25,7 +25,7 @@
 - Install dependencies with `bun install --ignore-scripts`. Do not enable lifecycle scripts without approval.
 - Keep direct dependencies minimal. Review dependency and lockfile changes like source changes.
 - Use strict TypeScript and top-level imports. Avoid `any` and non-erasable TypeScript syntax.
-- Keep `extensions/pi-resume-search.ts` focused on registration. Put implementation under `src/` and tests under `test/`.
+- Keep `extensions/pi-session-search.ts` focused on registration. Put implementation under `src/` and tests under `test/`.
 - After code changes, run `bun run lint`.
 - Run `bun run test`. Use Vitest through the package script, not Bun's test runner. ripgrep-backed tests skip when `rg` is missing.
 - Use `bun run format` for explicit formatting and lint fixes. Do not weaken checks to make them pass.

@@ -1,4 +1,5 @@
-import { readdir, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import {
@@ -7,7 +8,12 @@ import {
   type RipgrepOptions,
   runRipgrepOverFiles,
 } from "./ripgrep";
-import type { SessionMeta, SessionScope } from "./types";
+import type {
+  SearchRole,
+  SessionDocument,
+  SessionMeta,
+  SessionScope,
+} from "./types";
 
 /**
  * Mirrors pi's private getDefaultSessionDirPath(): the per-project session
@@ -249,4 +255,93 @@ export async function listSessions(
   }
   sessions.sort((a, b) => b.modified - a.modified);
   return sessions;
+}
+
+export function resolveSessionScope(
+  cwd: string,
+  configuredSessionDir?: string,
+): SessionScope {
+  if (configuredSessionDir) {
+    const sessionDir = resolve(cwd, configuredSessionDir);
+    return {
+      cwd,
+      sessionDir,
+      filterByCwd: false,
+    };
+  }
+
+  const localPiSessions = join(cwd, ".pi", "sessions");
+  if (existsSync(localPiSessions)) {
+    return {
+      cwd,
+      sessionDir: localPiSessions,
+      filterByCwd: false,
+    };
+  }
+
+  const fallback = defaultSessionDir(cwd);
+  return {
+    cwd,
+    sessionDir: fallback,
+    filterByCwd: false,
+  };
+}
+
+export async function readSessionDocuments(
+  filePath: string,
+  roleFilter: "all" | SearchRole = "all",
+  limit = 50,
+): Promise<SessionDocument[]> {
+  const content = await readFile(filePath, "utf8");
+  const lines = content.split("\n");
+  const documents: SessionDocument[] = [];
+
+  for (const line of lines) {
+    if (line.trim() === "") continue;
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (
+      !isRecord(entry) ||
+      entry.type !== "message" ||
+      typeof entry.id !== "string"
+    ) {
+      continue;
+    }
+    const message = entry.message;
+    if (!isRecord(message)) continue;
+    const role = message.role;
+    if (role !== "user" && role !== "assistant") continue;
+    if (roleFilter !== "all" && role !== roleFilter) continue;
+
+    let text = "";
+    if (typeof message.content === "string") {
+      text = message.content;
+    } else if (Array.isArray(message.content)) {
+      const parts: string[] = [];
+      for (const block of message.content) {
+        if (
+          isRecord(block) &&
+          block.type === "text" &&
+          typeof block.text === "string"
+        ) {
+          parts.push(block.text);
+        }
+      }
+      text = parts.join("\n");
+    }
+
+    if (!text) continue;
+    documents.push({
+      entryId: entry.id,
+      role,
+      text,
+    });
+    if (documents.length >= limit) break;
+  }
+
+  return documents;
 }

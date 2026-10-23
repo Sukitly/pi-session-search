@@ -285,7 +285,7 @@ describe.skipIf(!hasRipgrep())("searchSessions", () => {
     await expect(
       searchSessions(
         { kind: "literal", needle: "use", caseSensitive: false },
-        { sessions, ripgrepCommand: "pi-resume-search-missing-rg" },
+        { sessions, ripgrepCommand: "pi-session-search-missing-rg" },
       ),
     ).rejects.toMatchObject({ name: "RipgrepUnavailableError" });
   });

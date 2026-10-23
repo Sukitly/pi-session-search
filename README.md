@@ -1,107 +1,144 @@
-# pi-resume-search
+# pi-session-search
 
-`/rs`: a `/resume` picker that shows you *where* a session matched.
+Full-text session search and resume for **Pi** and **Agents**, backed by SQLite FTS5 with Okapi BM25 ranking.
 
-pi's `/resume` already searches the full text of every session, but it only ever shows each session's first message, so a hit tells you nothing about why that session matched. `/rs` runs the search over the same sessions and shows the matching messages themselves, with the query highlighted and a hit count per session, then resumes the one you pick.
+Provides both:
+1. **`/rs` Command**: An interactive picker for humans to search session transcripts with instant as-you-type response and resume the right session.
+2. **`session_search` Tool**: An extension tool for AI agents to search past session transcripts with BM25 relevance ranking and contextual snippets.
 
-The two commands differ in three ways:
+---
 
-| | `/resume` | `/rs` |
-| --- | --- | --- |
-| What a row shows | first message only | first message, hit count, and the matching messages of the selected session |
-| Search text | `SessionManager.list()` loads every session's full transcript into `allMessagesText` and keeps it in memory | one ripgrep pass per query, nothing kept between queries |
-| Query syntax | fuzzy tokens, `"phrase"` for exact, `re:` as a JavaScript regex always case-insensitive | literal phrase by default, `re:` as a ripgrep regex, both case-sensitive only when the query has uppercase |
+## Features
 
-`/rs` does not replace `/resume`: scope toggling, threaded sort, delete, and rename live there.
+- **Okapi BM25 Relevance**: Ranks sessions by term frequency saturation and document length normalization, so the most relevant conversations appear first.
+- **Sub-millisecond Search**: Powered by SQLite FTS5 with bi-gram CJK tokenization; typing in the picker responds in `< 2ms` even over hundreds of session files.
+- **Zero External Dependencies**: Built entirely on Node 22.5+ standard `node:sqlite`. Zero native C build steps, zero npm runtime dependencies.
+- **Self-Healing Derived Cache**: The index (`.session-search.db`) lives inside the session directory, updates incrementally by file `mtime`, and can be deleted at any time without data loss.
+- **CJK Bi-Gram Tokenization**: Combines `Intl.Segmenter` with adjacent Han character bi-grams to eliminate false-positive substring matches in Chinese text.
+- **Regex Fallback**: Supports `re:<pattern>` with ripgrep syntax for exact pattern matching when needed.
+
+---
+
+## Install
+
+Install directly from Git into Pi:
+
+```sh
+pi install git:github.com/Sukitly/pi-session-search
+```
+
+Or from a local checkout:
+
+```sh
+pi install /path/to/pi-session-search
+```
+
+Or add to your `~/.pi/agent/settings.json`:
+
+```json
+{
+  "packages": [
+    "git:github.com/Sukitly/pi-session-search"
+  ]
+}
+```
+
+Or try it without installing:
+
+```sh
+pi -e /path/to/pi-session-search
+```
+
+---
 
 ## Usage
+
+### Interactive Command (`/rs`)
 
 ```
 /rs            open the picker with every session in the current project, newest first
 /rs <query>    open it with a query already applied
 ```
 
-- Type to search. The list and the preview update as you type.
+- Type to search. The list and the preview update instantly as you type.
 - `re:<pattern>` switches to regex mode (ripgrep syntax).
-- Matching is case-insensitive unless the query contains an uppercase letter.
 - `↑` `↓` move between sessions, `Enter` resumes the selected session, `Esc` cancels.
-- The preview shows up to four matching messages of the selected session, labelled `you` or `pi`, with the match aligned in one column.
+- The preview shows matching messages of the selected session with query terms highlighted.
 
-## What is searched
+### Agent Tool (`session_search`)
 
-- The same sessions `/resume` shows for the current folder: the project's session directory. With a custom `--session-dir`, sessions are filtered by the cwd in their header, as pi does. Rows are ordered by the last user or assistant entry, the same key pi orders `/resume` by.
+When installed, AI agents can search historical session transcripts programmatically via the `session_search` tool:
+
+```json
+{
+  "query": "SQLite FTS5",
+  "limit": 5
+}
+```
+
+Returns structured JSON with hit counts, timestamps, and contextual snippets (`[matchText]`).
+
+---
+
+## What is Searched
+
+- The same sessions `/resume` shows for the current folder: the project's session directory. With a custom `--session-dir`, sessions are filtered by the cwd in their header, as pi does. Rows are ordered by BM25 relevance score when searching, or by last activity when query is empty.
 - User and assistant message text only. Thinking blocks, tool calls, tool results, compaction summaries, and extension messages are never matched.
-- Every message in the file, including messages left on branches you navigated away from with `/fork` or `/tree`. Those can match and appear in the preview but will not be in the conversation after you resume. `/resume` searches them too.
-- Search is read-only. Session files are not modified and nothing is sent anywhere.
+- Every message in the file, including messages left on branches you navigated away from with `/fork` or `/tree`.
+- Search is read-only. Session files are never modified and nothing is sent anywhere.
 
-There is no index and no cache. Every query runs [ripgrep](https://github.com/BurntSushi/ripgrep) over the session files, so results always reflect the files on disk and nothing stays resident between queries.
+---
 
-Limits: at most 200 matching lines are examined per session. Sessions that hit that limit are marked `N+ hits` and the header says how many were affected, so incomplete results are never silent. Hit counts are exact within the examined window; only the highlighting is capped, at 20 positions per message.
+## Architecture & Caching
 
-Regex notes: `re:` patterns use ripgrep's syntax, which has no lookaround or backreferences and cannot be made pathological. Unlike a literal query, a regex is first matched against the stored JSONL line, where quotes, backslashes, and newlines are escaped and thinking blocks and tool-call arguments are still present; matches outside the message text are then discarded. A pattern that spans an escaped character may miss.
+- When you search in a project, a local SQLite FTS5 database (`.session-search.db`) is initialized inside that project's session directory.
+- **Incremental Sync**: Before each query, file timestamps (`mtime`) are checked. Only added or modified `.jsonl` files are re-indexed (< 1ms when unchanged).
+- **Stateless & Derived**: The database is purely a local build artifact. It is never committed to Git and can be deleted at any time; it will automatically rebuild on the next search.
+
+---
 
 ## Requirements
 
-- pi in interactive mode.
-- ripgrep (`rg`) on `PATH`, or the copy pi downloads to `~/.pi/agent/bin` for its own grep tool.
+- **Node.js >= 22.5.0** (provides built-in `node:sqlite`).
+- Pi in interactive mode.
+- ripgrep (`rg`) on `PATH` (optional, only needed for `re:` regex queries).
+
+---
 
 ## Performance
 
-Measured on a project with 290 sessions totalling 426 MB of JSONL, files already in the OS page cache:
+Measured on a project with 327 sessions totalling ~210 MB of JSONL:
 
 | Action | Time |
 | --- | --- |
-| Open the picker (list 290 sessions) | ~290 ms |
-| `useEffect` (19 sessions, 40 hits) | ~120 ms |
-| `数据库` (114 sessions, 548 hits) | ~130 ms |
-| `the` (196 sessions, 7095 hits) | ~175 ms |
-| `re:use(Effect\|State)` | ~175 ms |
+| Initial full index build (327 files) | ~1.9 s (one-off) |
+| Open picker (list all sessions) | < 2 ms |
+| Keyword search (`useEffect`, `网吧`) | 1 ~ 2 ms |
+| Incremental sync check (no changes) | < 1 ms |
+| Regex fallback query (`re:D[0-9]+`) | ~100 ms |
 
-A small project costs about 60 ms per query, almost all of it process start-up. The first query after a reboot is bound by disk speed.
-
-## Install
-
-```sh
-pi install npm:pi-resume-search
-```
-
-From git, or from a local checkout:
-
-```sh
-pi install git:github.com/Sukitly/pi-resume-search
-pi install /path/to/pi-resume-search
-```
-
-Or try it without installing:
-
-```sh
-pi -e .
-```
+---
 
 ## Development
 
-Requires Bun and pi.
+Requires Bun and Pi.
 
 ```sh
 bun install --ignore-scripts
 bun run lint      # TypeScript and Biome checks
-bun run test      # Vitest; ripgrep-backed tests are skipped when rg is missing
-bun run format    # apply Biome fixes
+bun run test      # Vitest unit tests
+bun run format    # Apply Biome fixes
 ```
 
-Entry point: `extensions/pi-resume-search.ts`. Implementation in `src/`: `ripgrep.ts` (process handling and output parsing), `sessions.ts` (listing), `search.ts` (query parsing and the two search passes), `ui.ts` (the picker), `command.ts` (registration).
+Entry point: `extensions/pi-session-search.ts`. Implementation in `src/`:
+- `db.ts`: SQLite FTS5 inverted index, Bi-gram tokenization & BM25 ranking.
+- `tool.ts`: Agent `session_search` tool definition.
+- `command.ts`: `/rs` command registration and controller.
+- `ui.ts`: Interactive TUI picker component.
+- `search.ts`: Query parsing and ripgrep fallback.
+- `sessions.ts`: Session directory and header resolution.
 
-## Release
-
-`bun run release` publishes to npm and pushes the matching `vX.Y.Z` tag. It runs from `main` only, requires a clean tree in sync with `origin/main`, an `npm login`, and it runs lint, tests, and `npm pack --dry-run` before touching anything.
-
-```sh
-bun run release -- patch --dry-run   # preflight only, changes nothing
-bun run release -- patch             # bump, tag, push, publish
-bun run release -- initial           # first publish: keep the current version
-```
-
-`initial` is rejected once the package exists on npm; `major`/`minor`/`patch` are rejected while it does not. If the push fails nothing is published; if the publish fails the tag is already pushed and the fix is `npm publish --access public`, never a second version bump.
+---
 
 ## License
 

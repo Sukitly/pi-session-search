@@ -93,7 +93,7 @@ describe("runRipgrep with a missing executable", () => {
     await expect(
       runRipgrep(["-e", "x"], {
         input: "x",
-        command: "pi-resume-search-missing-rg",
+        command: "pi-session-search-missing-rg",
       }),
     ).rejects.toBeInstanceOf(RipgrepUnavailableError);
     expect(new RipgrepError(2, "rg: boom\n").message).toBe("boom");
@@ -101,7 +101,7 @@ describe("runRipgrep with a missing executable", () => {
 
   it("names every candidate when none can be spawned", async () => {
     const saved = process.env.PATH;
-    process.env.PATH = "/pi-resume-search-empty-path";
+    process.env.PATH = "/pi-session-search-empty-path";
     try {
       await runRipgrep(["-e", "x"], { input: "x" });
       expect.unreachable("should not find ripgrep");
