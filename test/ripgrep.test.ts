@@ -101,7 +101,9 @@ describe("runRipgrep with a missing executable", () => {
 
   it("names every candidate when none can be spawned", async () => {
     const saved = process.env.PATH;
+    const savedAgentDir = process.env.PI_CODING_AGENT_DIR;
     process.env.PATH = "/pi-session-search-empty-path";
+    process.env.PI_CODING_AGENT_DIR = "/pi-session-search-empty-agent-dir";
     try {
       await runRipgrep(["-e", "x"], { input: "x" });
       expect.unreachable("should not find ripgrep");
@@ -112,6 +114,8 @@ describe("runRipgrep with a missing executable", () => {
       expect(message).toContain("bin/rg");
     } finally {
       process.env.PATH = saved;
+      if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
     }
   });
 });

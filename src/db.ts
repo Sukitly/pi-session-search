@@ -1,5 +1,6 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { createReadStream, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import { buildSnippet } from "./search";
 import type {
@@ -190,7 +191,8 @@ export function getSessionDatabase(sessionDir: string): DatabaseSync {
       name TEXT,
       title TEXT,
       modified INTEGER,
-      mtime_ms REAL NOT NULL
+      mtime_ms REAL NOT NULL,
+      indexed_mtime_ms REAL
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_meta_modified ON sessions_meta(modified DESC);
     CREATE INDEX IF NOT EXISTS idx_sessions_meta_id ON sessions_meta(id);
@@ -206,8 +208,375 @@ export function getSessionDatabase(sessionDir: string): DatabaseSync {
     );
   `);
 
+  try {
+    db.exec("ALTER TABLE sessions_meta ADD COLUMN indexed_mtime_ms REAL;");
+  } catch {
+    // Column already exists
+  }
+
   dbCache.set(dbPath, db);
   return db;
+}
+
+export async function readSessionMetadata(
+  filePath: string,
+  mtimeMs: number,
+  signal?: AbortSignal,
+): Promise<(SessionMeta & { mtimeMs: number }) | undefined> {
+  let stream: ReturnType<typeof createReadStream>;
+  try {
+    stream = createReadStream(filePath, { encoding: "utf8" });
+  } catch {
+    return undefined;
+  }
+  const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+  let id: string | undefined;
+  let cwd = "";
+  let created: number | undefined;
+  let name: string | undefined;
+  let title: string | undefined;
+  let lastActivity: number | undefined;
+
+  try {
+    for await (const line of rl) {
+      if (signal?.aborted) break;
+      if (!line.trim()) continue;
+      let entry: Record<string, unknown>;
+      try {
+        entry = JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+
+      if (entry.type === "session") {
+        id = typeof entry.id === "string" ? entry.id : undefined;
+        cwd = typeof entry.cwd === "string" ? entry.cwd : "";
+        if (typeof entry.timestamp === "string") {
+          const t = new Date(entry.timestamp).getTime();
+          if (!Number.isNaN(t)) created = t;
+        }
+      } else if (entry.type === "session_info") {
+        if (typeof entry.name === "string") {
+          name = entry.name.replace(/[\s\p{Cc}]+/gu, " ").trim();
+        }
+      } else if (entry.type === "message") {
+        const msg = entry.message as Record<string, unknown> | undefined;
+        if (!msg) continue;
+        const role = msg.role;
+        if (role === "user" || role === "assistant") {
+          if (typeof entry.timestamp === "string") {
+            const t = new Date(entry.timestamp).getTime();
+            if (!Number.isNaN(t)) {
+              lastActivity = Math.max(lastActivity ?? 0, t);
+            }
+          }
+          if (title === undefined && role === "user") {
+            const text = extractMessageText(msg.content);
+            title = text
+              .replace(/[\s\p{Cc}]+/gu, " ")
+              .trim()
+              .slice(0, 300);
+            // Once we have header and title, stop reading
+            break;
+          }
+        }
+      }
+    }
+  } finally {
+    rl.close();
+    stream.destroy();
+  }
+
+  if (!id) return undefined;
+  return {
+    path: filePath,
+    id,
+    cwd,
+    name,
+    title: title || "(no messages)",
+    modified: lastActivity ?? created ?? mtimeMs,
+    mtimeMs,
+  };
+}
+
+export interface QuickSyncOptions {
+  signal?: AbortSignal;
+  onProgress?: (
+    loaded: number,
+    total: number,
+    partialSessions: SessionMeta[],
+  ) => void;
+}
+
+export async function syncMetadataQuick(
+  db: DatabaseSync,
+  scope: SessionScope,
+  options?: QuickSyncOptions,
+): Promise<SessionMeta[]> {
+  const signal = options?.signal;
+  let fileNames: string[];
+  try {
+    fileNames = readdirSync(scope.sessionDir).filter((f) =>
+      f.endsWith(".jsonl"),
+    );
+  } catch {
+    return [];
+  }
+
+  // Sort filenames descending to process newest sessions first (ISO timestamps)
+  fileNames.sort((a, b) => b.localeCompare(a));
+
+  const rows = db
+    .prepare(
+      "SELECT path, id, cwd, name, title, modified, mtime_ms FROM sessions_meta",
+    )
+    .all() as Array<{
+    path: string;
+    id: string;
+    cwd: string;
+    name: string | null;
+    title: string;
+    modified: number;
+    mtime_ms: number;
+  }>;
+
+  const dbMap = new Map<string, { meta: SessionMeta; mtimeMs: number }>();
+  for (const row of rows) {
+    dbMap.set(row.path, {
+      meta: {
+        path: row.path,
+        id: row.id,
+        cwd: row.cwd,
+        name: row.name ?? undefined,
+        title: row.title,
+        modified: row.modified,
+      },
+      mtimeMs: row.mtime_ms,
+    });
+  }
+
+  const diskFiles: Array<{ path: string; mtimeMs: number }> = [];
+  const diskPathSet = new Set<string>();
+
+  for (const name of fileNames) {
+    const fullPath = join(scope.sessionDir, name);
+    try {
+      const st = statSync(fullPath);
+      if (st.isFile()) {
+        diskFiles.push({ path: fullPath, mtimeMs: st.mtimeMs });
+        diskPathSet.add(fullPath);
+      }
+    } catch {
+      // Ignore unreadable files
+    }
+  }
+
+  const toDelete: string[] = [];
+  for (const path of dbMap.keys()) {
+    if (!diskPathSet.has(path)) {
+      toDelete.push(path);
+    }
+  }
+
+  const toScan: Array<{ path: string; mtimeMs: number }> = [];
+  const validCached: SessionMeta[] = [];
+
+  for (const file of diskFiles) {
+    const cached = dbMap.get(file.path);
+    if (cached && Math.abs(cached.mtimeMs - file.mtimeMs) <= 1) {
+      validCached.push(cached.meta);
+    } else {
+      toScan.push(file);
+    }
+  }
+
+  // If there are files to delete, remove them from database
+  if (toDelete.length > 0) {
+    const deleteMetaStmt = db.prepare(
+      "DELETE FROM sessions_meta WHERE path = ?",
+    );
+    const deleteFtsStmt = db.prepare(
+      "DELETE FROM messages_fts WHERE session_path = ?",
+    );
+    db.exec("BEGIN IMMEDIATE TRANSACTION;");
+    try {
+      for (const p of toDelete) {
+        deleteMetaStmt.run(p);
+        deleteFtsStmt.run(p);
+      }
+      db.exec("COMMIT;");
+    } catch {
+      db.exec("ROLLBACK;");
+    }
+  }
+
+  // If nothing to scan, return valid cached sessions ordered by modified desc
+  if (toScan.length === 0) {
+    validCached.sort((a, b) => b.modified - a.modified);
+    return validCached;
+  }
+
+  // Scan new/modified files with concurrency
+  const scannedMetas: Array<SessionMeta & { mtimeMs: number }> = [];
+  const allCurrent = [...validCached];
+
+  let nextIndex = 0;
+  let loaded = 0;
+  const total = toScan.length;
+
+  const reportProgress = () => {
+    if (!options?.onProgress || signal?.aborted) return;
+    const combined = [...allCurrent].sort((a, b) => b.modified - a.modified);
+    options.onProgress(loaded, total, combined);
+  };
+
+  const CONCURRENCY = 10;
+  const worker = async () => {
+    while (nextIndex < toScan.length) {
+      if (signal?.aborted) return;
+      const file = toScan[nextIndex++];
+      if (!file) break;
+      const meta = await readSessionMetadata(file.path, file.mtimeMs, signal);
+      loaded++;
+      if (meta) {
+        scannedMetas.push(meta);
+        allCurrent.push(meta);
+      }
+      if (loaded === 1 || loaded % 10 === 0 || loaded === total) {
+        reportProgress();
+      }
+    }
+  };
+
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, toScan.length) }, () =>
+      worker(),
+    ),
+  );
+
+  if (signal?.aborted) {
+    return allCurrent.sort((a, b) => b.modified - a.modified);
+  }
+
+  // Persist newly scanned metadata to sessions_meta
+  if (scannedMetas.length > 0) {
+    const deleteMetaStmt = db.prepare(
+      "DELETE FROM sessions_meta WHERE path = ?",
+    );
+    const insertMetaStmt = db.prepare(`
+      INSERT INTO sessions_meta (path, id, cwd, name, title, modified, mtime_ms, indexed_mtime_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+    `);
+
+    db.exec("BEGIN IMMEDIATE TRANSACTION;");
+    try {
+      for (const meta of scannedMetas) {
+        deleteMetaStmt.run(meta.path);
+        insertMetaStmt.run(
+          meta.path,
+          meta.id,
+          meta.cwd,
+          meta.name ?? null,
+          meta.title,
+          meta.modified,
+          meta.mtimeMs,
+        );
+      }
+      db.exec("COMMIT;");
+    } catch (err) {
+      db.exec("ROLLBACK;");
+      throw err;
+    }
+  }
+
+  return allCurrent.sort((a, b) => b.modified - a.modified);
+}
+
+export interface BackgroundFtsOptions {
+  signal?: AbortSignal;
+  onFileIndexed?: (path: string, indexed: number, total: number) => void;
+}
+
+export async function syncFtsBackground(
+  db: DatabaseSync,
+  _scope: SessionScope,
+  options?: BackgroundFtsOptions,
+): Promise<void> {
+  const signal = options?.signal;
+  if (signal?.aborted) return;
+
+  const rows = db
+    .prepare(`
+      SELECT path, mtime_ms
+      FROM sessions_meta
+      WHERE indexed_mtime_ms IS NULL OR abs(indexed_mtime_ms - mtime_ms) > 1
+      ORDER BY modified DESC
+    `)
+    .all() as Array<{
+    path: string;
+    mtime_ms: number;
+  }>;
+
+  if (rows.length === 0) return;
+
+  const deleteFtsStmt = db.prepare(
+    "DELETE FROM messages_fts WHERE session_path = ?",
+  );
+  const insertFtsStmt = db.prepare(`
+    INSERT INTO messages_fts (session_path, session_id, entry_id, role, content, tokens)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const updateMetaIndexedStmt = db.prepare(`
+    UPDATE sessions_meta
+    SET indexed_mtime_ms = ?
+    WHERE path = ?
+  `);
+
+  let count = 0;
+  const total = rows.length;
+
+  for (const file of rows) {
+    if (signal?.aborted) return;
+
+    const parsed = parseSessionFile(file.path, file.mtime_ms);
+    if (signal?.aborted) return;
+
+    if (parsed) {
+      db.exec("BEGIN IMMEDIATE TRANSACTION;");
+      try {
+        deleteFtsStmt.run(file.path);
+        for (const m of parsed.messages) {
+          const tokens = tokenizeForFts(m.text, false).join(" ");
+          insertFtsStmt.run(
+            parsed.meta.path,
+            parsed.meta.id,
+            m.entryId,
+            m.role,
+            m.text,
+            tokens,
+          );
+        }
+        updateMetaIndexedStmt.run(file.mtime_ms, file.path);
+        db.exec("COMMIT;");
+      } catch {
+        db.exec("ROLLBACK;");
+      }
+    } else {
+      // Avoid infinitely re-trying unparseable files
+      try {
+        updateMetaIndexedStmt.run(file.mtime_ms, file.path);
+      } catch {
+        // ignore
+      }
+    }
+
+    count++;
+    options?.onFileIndexed?.(file.path, count, total);
+
+    // Yield to the event loop between files
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
 }
 
 export function syncDatabase(db: DatabaseSync, scope: SessionScope): void {
@@ -221,14 +590,21 @@ export function syncDatabase(db: DatabaseSync, scope: SessionScope): void {
   }
 
   const rows = db
-    .prepare("SELECT path, mtime_ms FROM sessions_meta")
+    .prepare("SELECT path, mtime_ms, indexed_mtime_ms FROM sessions_meta")
     .all() as Array<{
     path: string;
     mtime_ms: number;
+    indexed_mtime_ms: number | null;
   }>;
-  const dbMap = new Map<string, number>();
+  const dbMap = new Map<
+    string,
+    { mtimeMs: number; indexedMtimeMs: number | null }
+  >();
   for (const row of rows) {
-    dbMap.set(row.path, row.mtime_ms);
+    dbMap.set(row.path, {
+      mtimeMs: row.mtime_ms,
+      indexedMtimeMs: row.indexed_mtime_ms,
+    });
   }
 
   const diskFiles: Array<{ path: string; mtimeMs: number }> = [];
@@ -256,8 +632,13 @@ export function syncDatabase(db: DatabaseSync, scope: SessionScope): void {
 
   const toIndex: Array<{ path: string; mtimeMs: number }> = [];
   for (const file of diskFiles) {
-    const dbMtime = dbMap.get(file.path);
-    if (dbMtime === undefined || Math.abs(dbMtime - file.mtimeMs) > 1) {
+    const dbEntry = dbMap.get(file.path);
+    if (
+      dbEntry === undefined ||
+      Math.abs(dbEntry.mtimeMs - file.mtimeMs) > 1 ||
+      dbEntry.indexedMtimeMs === null ||
+      Math.abs(dbEntry.indexedMtimeMs - file.mtimeMs) > 1
+    ) {
       toIndex.push(file);
     }
   }
@@ -271,8 +652,8 @@ export function syncDatabase(db: DatabaseSync, scope: SessionScope): void {
     "DELETE FROM messages_fts WHERE session_path = ?",
   );
   const insertMetaStmt = db.prepare(`
-    INSERT INTO sessions_meta (path, id, cwd, name, title, modified, mtime_ms)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO sessions_meta (path, id, cwd, name, title, modified, mtime_ms, indexed_mtime_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertFtsStmt = db.prepare(`
     INSERT INTO messages_fts (session_path, session_id, entry_id, role, content, tokens)
@@ -300,6 +681,7 @@ export function syncDatabase(db: DatabaseSync, scope: SessionScope): void {
         parsed.meta.name ?? null,
         parsed.meta.title,
         parsed.meta.modified,
+        parsed.meta.mtimeMs,
         parsed.meta.mtimeMs,
       );
 

@@ -119,6 +119,11 @@ export class SessionSearchView implements Component, Focusable {
   private searching = false;
   private finished = false;
 
+  private scanLoaded = 0;
+  private scanTotal = 0;
+  private indexingDone = 0;
+  private indexingTotal = 0;
+
   private debounceTimer: NodeJS.Timeout | undefined;
   private inFlight: AbortController | undefined;
   private generation = 0;
@@ -154,9 +159,37 @@ export class SessionSearchView implements Component, Focusable {
   }
 
   setSessions(sessions: SessionMeta[]): void {
+    const previousPath = this.getSelectedSessionPath();
     this.sessions = sessions;
     this.loadError = undefined;
     this.runSearch(true);
+    if (previousPath) {
+      const newIndex = this.rows.findIndex(
+        (r) => r.session.path === previousPath,
+      );
+      if (newIndex !== -1 && newIndex !== this.selectedIndex) {
+        this.selectedIndex = newIndex;
+        this.requestRender();
+      }
+    }
+  }
+
+  setScanProgress(loaded: number, total: number): void {
+    this.scanLoaded = loaded;
+    this.scanTotal = total;
+    this.requestRender();
+  }
+
+  setIndexingProgress(done: number, total: number): void {
+    this.indexingDone = done;
+    this.indexingTotal = total;
+    this.requestRender();
+  }
+
+  refreshSearch(): void {
+    if (this.parsed.kind !== "empty" && !this.searching) {
+      this.runSearch(true);
+    }
   }
 
   setLoadError(error: unknown): void {
@@ -243,11 +276,22 @@ export class SessionSearchView implements Component, Focusable {
     if (this.loadError) {
       right = theme.fg("error", "Unavailable");
     } else if (!this.sessions) {
-      right = theme.fg("accent", "Loading…");
+      if (this.scanTotal > 0) {
+        right = theme.fg(
+          "accent",
+          `Loading ${this.scanLoaded}/${this.scanTotal}…`,
+        );
+      } else {
+        right = theme.fg("accent", "Loading…");
+      }
     } else if (this.searching) {
       right = theme.fg("accent", "Searching…");
     } else if (this.parsed.kind === "empty") {
-      right = theme.fg("muted", `${this.sessions.length} sessions`);
+      let status = `${this.sessions.length} sessions`;
+      if (this.indexingTotal > 0 && this.indexingDone < this.indexingTotal) {
+        status += ` · indexing ${this.indexingDone}/${this.indexingTotal}`;
+      }
+      right = theme.fg("muted", status);
     } else {
       const hits = this.rows.reduce(
         (sum, row) => sum + (row.match?.hitCount ?? 0),

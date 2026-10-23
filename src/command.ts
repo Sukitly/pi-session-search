@@ -5,10 +5,11 @@ import type {
 import {
   getSessionDatabase,
   listRecentSessionsFromDb,
-  syncDatabase,
+  syncFtsBackground,
+  syncMetadataQuick,
 } from "./db";
 import { searchSessions } from "./search";
-import { defaultSessionDir, listSessions } from "./sessions";
+import { defaultSessionDir, listSessions, sessionCwdMatches } from "./sessions";
 import type { SessionScope } from "./types";
 import { SessionSearchView } from "./ui";
 
@@ -88,12 +89,31 @@ export function registerResumeSearch(pi: ExtensionAPI): void {
             }
           }
 
-          // 2. Perform sync asynchronously in the background so UI opens with 0ms freeze
-          setTimeout(() => {
+          // 2. Perform fast progressive metadata scan + background non-blocking FTS sync
+          void (async () => {
             if (listing.signal.aborted) return;
             if (db) {
               try {
-                syncDatabase(db, scope);
+                await syncMetadataQuick(db, scope, {
+                  signal: listing.signal,
+                  onProgress: (loaded, total, partial) => {
+                    if (listing.signal.aborted) return;
+                    view.setScanProgress(loaded, total);
+                    if (!hasCached) {
+                      const filtered =
+                        scope.filterByCwd && scope.cwd
+                          ? partial.filter((s) =>
+                              sessionCwdMatches(s.cwd, scope.cwd),
+                            )
+                          : partial;
+                      if (filtered.length > 0) {
+                        view.setSessions(filtered);
+                      }
+                    }
+                  },
+                });
+
+                if (listing.signal.aborted) return;
                 const fresh = listRecentSessionsFromDb(
                   db,
                   undefined,
@@ -101,8 +121,21 @@ export function registerResumeSearch(pi: ExtensionAPI): void {
                   scope.cwd,
                 );
                 view.setSessions(fresh);
+                hasCached = true;
+
+                // 3. Background non-blocking FTS indexing
+                await syncFtsBackground(db, scope, {
+                  signal: listing.signal,
+                  onFileIndexed: (_path, done, total) => {
+                    if (listing.signal.aborted) return;
+                    view.setIndexingProgress(done, total);
+                    if (view.getQuery().trim() !== "") {
+                      view.refreshSearch();
+                    }
+                  },
+                });
               } catch {
-                if (!hasCached) {
+                if (!hasCached && !listing.signal.aborted) {
                   listSessions(scope, { signal: listing.signal })
                     .then((sessions) => view.setSessions(sessions))
                     .catch((error: unknown) => {
@@ -119,7 +152,7 @@ export function registerResumeSearch(pi: ExtensionAPI): void {
                   view.setLoadError(error);
                 });
             }
-          }, 0);
+          })();
 
           return view;
         },
