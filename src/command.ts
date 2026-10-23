@@ -41,17 +41,15 @@ export function registerResumeSearch(pi: ExtensionAPI): void {
       const scope = scopeFromContext(ctx);
       const currentSessionPath = ctx.sessionManager.getSessionFile();
 
-      let db: ReturnType<typeof getSessionDatabase> | undefined;
-      try {
-        db = getSessionDatabase(scope.sessionDir);
-        syncDatabase(db, scope);
-      } catch {
-        // Fallback to purely ripgrep if SQLite fails
-        db = undefined;
-      }
-
       const selected = await ctx.ui.custom<string | undefined>(
         (tui, theme, keybindings, done) => {
+          let db: ReturnType<typeof getSessionDatabase> | undefined;
+          try {
+            db = getSessionDatabase(scope.sessionDir);
+          } catch {
+            db = undefined;
+          }
+
           const listing = new AbortController();
           const view = new SessionSearchView({
             theme,
@@ -71,16 +69,49 @@ export function registerResumeSearch(pi: ExtensionAPI): void {
             },
           });
 
+          // 1. Immediately populate from SQLite cache if available (< 1ms)
+          let hasCached = false;
           if (db) {
             try {
-              const sessions = listRecentSessionsFromDb(
+              const cached = listRecentSessionsFromDb(
                 db,
                 undefined,
                 scope.filterByCwd,
                 scope.cwd,
               );
-              view.setSessions(sessions);
-            } catch (_err) {
+              if (cached.length > 0) {
+                view.setSessions(cached);
+                hasCached = true;
+              }
+            } catch {
+              // ignore cache read failure
+            }
+          }
+
+          // 2. Perform sync asynchronously in the background so UI opens with 0ms freeze
+          setTimeout(() => {
+            if (listing.signal.aborted) return;
+            if (db) {
+              try {
+                syncDatabase(db, scope);
+                const fresh = listRecentSessionsFromDb(
+                  db,
+                  undefined,
+                  scope.filterByCwd,
+                  scope.cwd,
+                );
+                view.setSessions(fresh);
+              } catch {
+                if (!hasCached) {
+                  listSessions(scope, { signal: listing.signal })
+                    .then((sessions) => view.setSessions(sessions))
+                    .catch((error: unknown) => {
+                      if (listing.signal.aborted) return;
+                      view.setLoadError(error);
+                    });
+                }
+              }
+            } else {
               listSessions(scope, { signal: listing.signal })
                 .then((sessions) => view.setSessions(sessions))
                 .catch((error: unknown) => {
@@ -88,14 +119,8 @@ export function registerResumeSearch(pi: ExtensionAPI): void {
                   view.setLoadError(error);
                 });
             }
-          } else {
-            listSessions(scope, { signal: listing.signal })
-              .then((sessions) => view.setSessions(sessions))
-              .catch((error: unknown) => {
-                if (listing.signal.aborted) return;
-                view.setLoadError(error);
-              });
-          }
+          }, 0);
+
           return view;
         },
       );
