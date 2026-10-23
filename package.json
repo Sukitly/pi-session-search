@@ -1,17 +1,17 @@
 {
-  "name": "pi-resume-search",
+  "name": "pi-session-search",
   "version": "0.1.0",
-  "description": "A /resume picker for pi that shows which messages matched your search, backed by ripgrep.",
+  "description": "Full-text session search and resume for Pi and Agents, backed by SQLite FTS5.",
   "type": "module",
   "license": "MIT",
   "author": "Sukitly",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Sukitly/pi-resume-search.git"
+    "url": "git+https://github.com/Sukitly/pi-session-search.git"
   },
-  "homepage": "https://github.com/Sukitly/pi-resume-search#readme",
+  "homepage": "https://github.com/Sukitly/pi-session-search#readme",
   "bugs": {
-    "url": "https://github.com/Sukitly/pi-resume-search/issues"
+    "url": "https://github.com/Sukitly/pi-session-search/issues"
   },
   "keywords": [
     "pi-package",
@@ -33,7 +33,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/pi-resume-search.ts"
+      "./extensions/pi-session-search.ts"
     ]
   },
   "scripts": {
@@ -45,7 +45,8 @@
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.13",

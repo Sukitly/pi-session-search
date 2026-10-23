@@ -2,10 +2,15 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
+import {
+  getSessionDatabase,
+  listRecentSessionsFromDb,
+  syncDatabase,
+} from "./db";
 import { searchSessions } from "./search";
 import { defaultSessionDir, listSessions } from "./sessions";
 import type { SessionScope } from "./types";
-import { ResumeSearchView } from "./ui";
+import { SessionSearchView } from "./ui";
 
 /** Short for "resume with search": the same flow as /resume, plus content search. */
 export const COMMAND_NAME = "rs";
@@ -36,14 +41,23 @@ export function registerResumeSearch(pi: ExtensionAPI): void {
       const scope = scopeFromContext(ctx);
       const currentSessionPath = ctx.sessionManager.getSessionFile();
 
+      let db: ReturnType<typeof getSessionDatabase> | undefined;
+      try {
+        db = getSessionDatabase(scope.sessionDir);
+        syncDatabase(db, scope);
+      } catch {
+        // Fallback to purely ripgrep if SQLite fails
+        db = undefined;
+      }
+
       const selected = await ctx.ui.custom<string | undefined>(
         (tui, theme, keybindings, done) => {
           const listing = new AbortController();
-          const view = new ResumeSearchView({
+          const view = new SessionSearchView({
             theme,
             keybindings,
             search: (query, sessions, signal) =>
-              searchSessions(query, { sessions, signal }),
+              searchSessions(query, { sessions, signal, db }),
             initialQuery: args.trim(),
             currentSessionPath,
             requestRender: () => tui.requestRender(),
@@ -56,12 +70,32 @@ export function registerResumeSearch(pi: ExtensionAPI): void {
               done(undefined);
             },
           });
-          listSessions(scope, { signal: listing.signal })
-            .then((sessions) => view.setSessions(sessions))
-            .catch((error: unknown) => {
-              if (listing.signal.aborted) return;
-              view.setLoadError(error);
-            });
+
+          if (db) {
+            try {
+              const sessions = listRecentSessionsFromDb(
+                db,
+                undefined,
+                scope.filterByCwd,
+                scope.cwd,
+              );
+              view.setSessions(sessions);
+            } catch (_err) {
+              listSessions(scope, { signal: listing.signal })
+                .then((sessions) => view.setSessions(sessions))
+                .catch((error: unknown) => {
+                  if (listing.signal.aborted) return;
+                  view.setLoadError(error);
+                });
+            }
+          } else {
+            listSessions(scope, { signal: listing.signal })
+              .then((sessions) => view.setSessions(sessions))
+              .catch((error: unknown) => {
+                if (listing.signal.aborted) return;
+                view.setLoadError(error);
+              });
+          }
           return view;
         },
       );

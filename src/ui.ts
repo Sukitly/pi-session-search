@@ -34,7 +34,7 @@ export interface Row {
   match?: SessionMatch;
 }
 
-export interface ResumeSearchViewOptions {
+export interface SessionSearchViewOptions {
   theme: Theme;
   keybindings: KeybindingsManager;
   search: SearchFn;
@@ -47,6 +47,8 @@ export interface ResumeSearchViewOptions {
   /** Delay between the last keystroke and the ripgrep run. */
   debounceMs?: number;
 }
+
+export type ResumeSearchViewOptions = SessionSearchViewOptions;
 
 /** Layout mirrors pi's /resume selector: 10 single-line rows. */
 const LIST_ROWS = 10;
@@ -94,7 +96,7 @@ type Notice = { color: "muted" | "warning" | "error"; text: string };
  * through the injected search function; an empty query lists every session.
  * Nothing is cached beyond the current rows.
  */
-export class ResumeSearchView implements Component, Focusable {
+export class SessionSearchView implements Component, Focusable {
   private readonly theme: Theme;
   private readonly keybindings: KeybindingsManager;
   private readonly search: SearchFn;
@@ -123,7 +125,7 @@ export class ResumeSearchView implements Component, Focusable {
 
   private _focused = false;
 
-  constructor(options: ResumeSearchViewOptions) {
+  constructor(options: SessionSearchViewOptions) {
     this.theme = options.theme;
     this.keybindings = options.keybindings;
     this.search = options.search;
@@ -514,3 +516,6 @@ export function describeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return `Search failed: ${message}`;
 }
+
+export type ResumeSearchView = SessionSearchView;
+export const ResumeSearchView = SessionSearchView;

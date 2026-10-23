@@ -15,3 +15,7 @@ coverage/
 *.pfx
 id_rsa
 id_ed25519
+
+# SQLite search cache
+**/.session-search.db*
+

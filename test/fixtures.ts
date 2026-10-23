@@ -126,7 +126,7 @@ export interface TempDir {
 }
 
 export async function makeTempDir(): Promise<TempDir> {
-  const path = await mkdtemp(join(tmpdir(), "pi-resume-search-"));
+  const path = await mkdtemp(join(tmpdir(), "pi-session-search-"));
   return {
     path,
     async write(name, content, mtimeMs) {
