@@ -3,9 +3,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   getSessionDatabase,
   listRecentSessionsFromDb,
+  readSessionMetadata,
   searchBM25ForUI,
   searchSessionsBM25,
   syncDatabase,
+  syncFtsBackground,
+  syncMetadataQuick,
   tokenizeForFts,
 } from "../src/db";
 import type { SessionScope } from "../src/types";
@@ -139,6 +142,67 @@ describe("db", () => {
       await rm(fileA);
       syncDatabase(db, scope);
       expect(listRecentSessionsFromDb(db).length).toBe(0);
+    });
+
+    it("syncMetadataQuick streams progressive updates and syncFtsBackground indexes messages", async () => {
+      const file1 = await temp.write(
+        "2026-09-02T10-00-00-000Z_session-1.jsonl",
+        sessionFile([
+          header("session-1", temp.path),
+          userLine("First session topic"),
+          assistantLine("Answer for first session"),
+        ]),
+      );
+
+      const meta1 = await readSessionMetadata(file1, 12345);
+      expect(meta1).toBeDefined();
+      expect(meta1?.id).toBe("session-1");
+      expect(meta1?.title).toBe("First session topic");
+
+      await temp.write(
+        "2026-09-02T11-00-00-000Z_session-2.jsonl",
+        sessionFile([
+          header("session-2", temp.path),
+          userLine("Second session topic with uniqueKeyword"),
+          assistantLine("Answer for second session"),
+        ]),
+      );
+
+      const db = getSessionDatabase(scope.sessionDir);
+      const progressCalls: Array<{ loaded: number; count: number }> = [];
+
+      const sessions = await syncMetadataQuick(db, scope, {
+        onProgress: (loaded, _total, partial) => {
+          progressCalls.push({ loaded, count: partial.length });
+        },
+      });
+
+      expect(sessions.length).toBe(2);
+      expect(progressCalls.length).toBeGreaterThan(0);
+      expect(progressCalls[0].count).toBeGreaterThanOrEqual(1);
+
+      // Metadata is stored in DB immediately
+      const recent = listRecentSessionsFromDb(db);
+      expect(recent.length).toBe(2);
+
+      // Before background FTS, keyword search finds 0
+      const beforeFts = searchBM25ForUI(db, "uniqueKeyword", recent);
+      expect(beforeFts.matches.length).toBe(0);
+
+      // Run background FTS
+      let indexedCount = 0;
+      await syncFtsBackground(db, scope, {
+        onFileIndexed: () => {
+          indexedCount++;
+        },
+      });
+
+      expect(indexedCount).toBe(2);
+
+      // After background FTS, keyword search finds session-2
+      const afterFts = searchBM25ForUI(db, "uniqueKeyword", recent);
+      expect(afterFts.matches.length).toBe(1);
+      expect(afterFts.matches[0].session.id).toBe("session-2");
     });
   });
 });
