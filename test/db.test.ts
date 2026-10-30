@@ -1,4 +1,6 @@
 import { rm } from "node:fs/promises";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   getSessionDatabase,
@@ -17,7 +19,10 @@ import {
   header,
   makeTempDir,
   sessionFile,
+  sessionInfoLine,
   type TempDir,
+  toolCallOnlyLine,
+  toolResultLine,
   userLine,
 } from "./fixtures";
 
@@ -203,6 +208,114 @@ describe("db", () => {
       const afterFts = searchBM25ForUI(db, "uniqueKeyword", recent);
       expect(afterFts.matches.length).toBe(1);
       expect(afterFts.matches[0].session.id).toBe("session-2");
+    });
+
+    it("uses the latest message timestamp and latest session_info name for resumed sessions", async () => {
+      const tCreatedOld = "2026-10-22T05:41:16.587Z";
+      const tFirstMsgOld = "2026-10-22T05:42:00.000Z";
+      const tCreatedNew = "2026-10-28T16:52:33.381Z";
+      const tFirstMsgNew = "2026-10-28T16:53:10.000Z";
+      const tResumedOld = "2026-10-30T02:27:25.876Z";
+
+      // Older session file that was resumed later on Oct 30 and renamed after the first message
+      await temp.write(
+        "2026-10-22T05-41-16-587Z_old-resumed.jsonl",
+        sessionFile([
+          header("old-resumed", temp.path, tCreatedOld),
+          userLine("你看看这个设计文档", tFirstMsgOld),
+          assistantLine("好的", [], tFirstMsgOld),
+          toolResultLine("large tool output", tFirstMsgOld),
+          sessionInfoLine("Renamed After First Message"),
+          userLine("继续修改", tResumedOld),
+          toolCallOnlyLine("ls", tResumedOld),
+        ]),
+      );
+
+      // Newer created session file that was not touched after Oct 28
+      await temp.write(
+        "2026-10-28T16-52-33-381Z_new-untouched.jsonl",
+        sessionFile([
+          header("new-untouched", temp.path, tCreatedNew),
+          userLine("当前 pi 的 TUI 怎么设置", tFirstMsgNew),
+          assistantLine("默认已开启", [], tFirstMsgNew),
+        ]),
+      );
+
+      const db = getSessionDatabase(scope.sessionDir);
+      const scanned = await syncMetadataQuick(db, scope);
+
+      expect(scanned.map((s) => s.id)).toEqual([
+        "old-resumed",
+        "new-untouched",
+      ]);
+      expect(scanned[0]?.modified).toBe(Date.parse(tResumedOld));
+      expect(scanned[0]?.name).toBe("Renamed After First Message");
+      expect(scanned[1]?.modified).toBe(Date.parse(tFirstMsgNew));
+
+      await syncFtsBackground(db, scope);
+      const fromDb = listRecentSessionsFromDb(db);
+      expect(fromDb.map((s) => s.id)).toEqual(["old-resumed", "new-untouched"]);
+      expect(fromDb[0]?.modified).toBe(Date.parse(tResumedOld));
+      expect(fromDb[0]?.name).toBe("Renamed After First Message");
+    });
+
+    it("migrates user_version 0 databases by forcing a metadata rescan while preserving indexed_mtime_ms", async () => {
+      const tInitial = "2026-10-22T05:42:00.000Z";
+      const tLatest = "2026-10-30T02:27:25.876Z";
+      const mtimeMs = 1793327245000;
+
+      const filePath = await temp.write(
+        "2026-10-22T05-41-16-587Z_migrated.jsonl",
+        sessionFile([
+          header("migrated", temp.path, tInitial),
+          userLine("First prompt", tInitial),
+          assistantLine("Later reply", [], tLatest),
+        ]),
+        mtimeMs,
+      );
+
+      // Simulate a pre-fix user_version=0 database with stale modified timestamp
+      const rawDb = new DatabaseSync(
+        join(scope.sessionDir, ".session-search.db"),
+      );
+      rawDb.exec(`
+        CREATE TABLE sessions_meta (
+          path TEXT PRIMARY KEY,
+          id TEXT NOT NULL,
+          cwd TEXT,
+          name TEXT,
+          title TEXT,
+          modified INTEGER,
+          mtime_ms REAL NOT NULL,
+          indexed_mtime_ms REAL
+        );
+        PRAGMA user_version = 0;
+      `);
+      rawDb
+        .prepare("INSERT INTO sessions_meta VALUES (?, ?, ?, NULL, ?, ?, ?, ?)")
+        .run(
+          filePath,
+          "migrated",
+          temp.path,
+          "First prompt",
+          Date.parse(tInitial),
+          mtimeMs,
+          mtimeMs,
+        );
+      rawDb.close();
+
+      const db = getSessionDatabase(scope.sessionDir);
+      const refreshed = await syncMetadataQuick(db, scope);
+      expect(refreshed[0]?.modified).toBe(Date.parse(tLatest));
+
+      // Because indexed_mtime_ms was preserved, syncFtsBackground does not need to re-index
+      let reindexed = 0;
+      await syncFtsBackground(db, scope, {
+        onFileIndexed: () => {
+          reindexed++;
+        },
+      });
+      expect(reindexed).toBe(0);
     });
   });
 });

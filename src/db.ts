@@ -122,16 +122,13 @@ function parseSessionFile(
       }
     } else if (entry.type === "session_info") {
       if (typeof entry.name === "string") {
-        name = entry.name.replace(/[\s\p{Cc}]+/gu, " ").trim();
+        name = entry.name.replace(/[\s\p{Cc}]+/gu, " ").trim() || undefined;
       }
     } else if (entry.type === "message") {
       const msg = entry.message as Record<string, unknown> | undefined;
       if (!msg) continue;
       const role = msg.role;
       if (role !== "user" && role !== "assistant") continue;
-
-      const text = extractMessageText(msg.content);
-      if (!text) continue;
 
       if (typeof entry.timestamp === "string") {
         const t = new Date(entry.timestamp).getTime();
@@ -140,11 +137,14 @@ function parseSessionFile(
         }
       }
 
+      const text = extractMessageText(msg.content);
+      if (!text) continue;
+
       if (title === undefined && role === "user") {
-        title = text
-          .replace(/[\s\p{Cc}]+/gu, " ")
-          .trim()
-          .slice(0, 300);
+        const collapsed = text.replace(/[\s\p{Cc}]+/gu, " ").trim();
+        if (collapsed) {
+          title = collapsed.slice(0, 300);
+        }
       }
 
       const entryId = typeof entry.id === "string" ? entry.id : "";
@@ -172,7 +172,13 @@ function parseSessionFile(
   };
 }
 
+const SCHEMA_VERSION = 1;
 const dbCache = new Map<string, DatabaseSync>();
+
+const FAST_MESSAGE_ACTIVITY_RE =
+  /^\{"type":"message",.{0,200}?"timestamp":"([^"]+)","message":\{"role":"(?:user|assistant)"/;
+const FAST_TOOL_RESULT_RE =
+  /^\{"type":"message",.{0,200}?"message":\{"role":"toolResult"/;
 
 export function getSessionDatabase(sessionDir: string): DatabaseSync {
   const dbPath = join(sessionDir, ".session-search.db");
@@ -214,6 +220,16 @@ export function getSessionDatabase(sessionDir: string): DatabaseSync {
     // Column already exists
   }
 
+  const versionRow = db.prepare("PRAGMA user_version").get() as
+    | { user_version: number }
+    | undefined;
+  if ((versionRow?.user_version ?? 0) < SCHEMA_VERSION) {
+    db.exec(`
+      UPDATE sessions_meta SET mtime_ms = 0;
+      PRAGMA user_version = ${SCHEMA_VERSION};
+    `);
+  }
+
   dbCache.set(dbPath, db);
   return db;
 }
@@ -242,6 +258,21 @@ export async function readSessionMetadata(
     for await (const line of rl) {
       if (signal?.aborted) break;
       if (!line.trim()) continue;
+
+      if (id !== undefined && title !== undefined) {
+        const activityMatch = FAST_MESSAGE_ACTIVITY_RE.exec(line);
+        if (activityMatch?.[1]) {
+          const t = Date.parse(activityMatch[1]);
+          if (!Number.isNaN(t)) {
+            lastActivity = Math.max(lastActivity ?? 0, t);
+          }
+          continue;
+        }
+        if (FAST_TOOL_RESULT_RE.test(line)) {
+          continue;
+        }
+      }
+
       let entry: Record<string, unknown>;
       try {
         entry = JSON.parse(line) as Record<string, unknown>;
@@ -258,7 +289,7 @@ export async function readSessionMetadata(
         }
       } else if (entry.type === "session_info") {
         if (typeof entry.name === "string") {
-          name = entry.name.replace(/[\s\p{Cc}]+/gu, " ").trim();
+          name = entry.name.replace(/[\s\p{Cc}]+/gu, " ").trim() || undefined;
         }
       } else if (entry.type === "message") {
         const msg = entry.message as Record<string, unknown> | undefined;
@@ -272,13 +303,12 @@ export async function readSessionMetadata(
             }
           }
           if (title === undefined && role === "user") {
-            const text = extractMessageText(msg.content);
-            title = text
+            const text = extractMessageText(msg.content)
               .replace(/[\s\p{Cc}]+/gu, " ")
-              .trim()
-              .slice(0, 300);
-            // Once we have header and title, stop reading
-            break;
+              .trim();
+            if (text) {
+              title = text.slice(0, 300);
+            }
           }
         }
       }
@@ -461,19 +491,22 @@ export async function syncMetadataQuick(
 
   // Persist newly scanned metadata to sessions_meta
   if (scannedMetas.length > 0) {
-    const deleteMetaStmt = db.prepare(
-      "DELETE FROM sessions_meta WHERE path = ?",
-    );
-    const insertMetaStmt = db.prepare(`
+    const upsertMetaStmt = db.prepare(`
       INSERT INTO sessions_meta (path, id, cwd, name, title, modified, mtime_ms, indexed_mtime_ms)
       VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(path) DO UPDATE SET
+        id = excluded.id,
+        cwd = excluded.cwd,
+        name = excluded.name,
+        title = excluded.title,
+        modified = excluded.modified,
+        mtime_ms = excluded.mtime_ms
     `);
 
     db.exec("BEGIN IMMEDIATE TRANSACTION;");
     try {
       for (const meta of scannedMetas) {
-        deleteMetaStmt.run(meta.path);
-        insertMetaStmt.run(
+        upsertMetaStmt.run(
           meta.path,
           meta.id,
           meta.cwd,
@@ -527,7 +560,12 @@ export async function syncFtsBackground(
     INSERT INTO messages_fts (session_path, session_id, entry_id, role, content, tokens)
     VALUES (?, ?, ?, ?, ?, ?)
   `);
-  const updateMetaIndexedStmt = db.prepare(`
+  const updateMetaParsedStmt = db.prepare(`
+    UPDATE sessions_meta
+    SET id = ?, cwd = ?, name = ?, title = ?, modified = ?, mtime_ms = ?, indexed_mtime_ms = ?
+    WHERE path = ?
+  `);
+  const updateMetaUnparseableStmt = db.prepare(`
     UPDATE sessions_meta
     SET indexed_mtime_ms = ?
     WHERE path = ?
@@ -557,7 +595,16 @@ export async function syncFtsBackground(
             tokens,
           );
         }
-        updateMetaIndexedStmt.run(file.mtime_ms, file.path);
+        updateMetaParsedStmt.run(
+          parsed.meta.id,
+          parsed.meta.cwd,
+          parsed.meta.name ?? null,
+          parsed.meta.title,
+          parsed.meta.modified,
+          parsed.meta.mtimeMs,
+          file.mtime_ms,
+          file.path,
+        );
         db.exec("COMMIT;");
       } catch {
         db.exec("ROLLBACK;");
@@ -565,7 +612,7 @@ export async function syncFtsBackground(
     } else {
       // Avoid infinitely re-trying unparseable files
       try {
-        updateMetaIndexedStmt.run(file.mtime_ms, file.path);
+        updateMetaUnparseableStmt.run(file.mtime_ms, file.path);
       } catch {
         // ignore
       }
